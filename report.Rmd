@@ -1,0 +1,190 @@
+---
+title: "Recognition of common mistakes in weight lifting exercises based on on-body sensors"
+author: "Stepan Kuntco <steplg@gmail.com>"
+date: "Saturday, September 20, 2014"
+output:
+  html_document:
+    fig_height: 7
+    fig_width: 10
+    keep_md: yes
+    css: report_deps/dataTables.foundation.css
+    template: _template.html
+---
+
+## Summary
+In this project there was attempt to train a multi-label classifier to predict common mistakes in weight-lifting excersizes. Data was originally collected in [Human Activity Recognition project](http://groupware.les.inf.puc-rio.br/har) (Weight Lifting Exercise Dataset).
+
+During analysis 4 models were able to show almost 100% accuracy on test set (which was randomly sampled from all data): Random forests, Polynomial svm, Stochastic Gradient Boosting and Bagged CART. Among them Polynomial SVM has the lowest training time (10 minutes vs 23 min for GBM, 34 min for RF and 41 for Bagged CART).
+
+## Environment
+```{r include=F}
+require(rCharts)
+
+require(caret)
+require(doParallel)
+
+# include explicitly required packages for training
+require(MASS)    # lda, qda
+require(rpart)   # rpart
+require(plyr)    # gbm,rpart
+require(gbm)     # gbm
+require(ipred)   # rpart
+require(randomForest) # rf
+require(kernlab) # svmPoly
+require(pROC)    # svmPoly (for varImp)
+```
+
+```{r}
+sessionInfo()
+```
+
+## Exploratory Analysis
+This dataset comes from [Human Activity Recognition project](http://groupware.les.inf.puc-rio.br/har#dataset), "Weight Lifting Exercises Dataset". 
+
+```{r cache=T}
+# download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv', 'pml-training.csv')
+# download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv', 'pml-testing.csv')
+
+set.train <- read.csv('pml-training.csv', na.strings=c('NA', '#DIV/0!'))
+set.validation <- read.csv('pml-testing.csv', na.strings=c('NA', '#DIV/0!'))
+```
+
+Set size:
+```{r}
+nrow(set.train)
+```
+
+Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).
+```{r}
+plot(set.train$classe, xlab='Activity', ylab='number of observations', main='Activities in dataset')
+```
+
+First six variables in dataset seems to be not very important for our training:
+```{r}
+head(names(set.train), n=6)
+```
+ * `X` - this is just order number.
+ * `user_name` - participant name, which actually could be used in training, but only in the way of personalization.
+ * `raw_timestamp_part_1`, `raw_timestamp_part_2`, `cvtd_timestamp` - various timestamps, which are also can't be used for training by itself. But they could be useful if we would be able to use some previous observations to predict current class, but in our conditions they are useless.
+ * `new_window` - factor variable, by nature very similar to timestamps: it's useless unless we can't use previous observations.
+```{r}
+set.train.1 <- set.train[, c(-1: -6)]
+``` 
+ 
+
+There are also a number of columns which are mostly NA. We should remove them to ensure that our training methods work correct:
+```{r}
+na.columns <- apply(set.train.1, 2, function(x) sum(is.na(x)) == 0)
+set.train.1 <- set.train.1[, na.columns]
+```
+
+Number of removed NA columns:
+```{r}
+sum(!na.columns)
+```
+
+Number of variables left to use in training:
+```{r}
+ncol(set.train.1) - 1
+```
+
+There are some highly correlated variables, but not too much, so we can leave them in the set:
+```{r}
+cor.matrix <- cor(subset(set.train.1, select=-c(classe)))
+colnames(subset(set.train.1, select=-c(classe)))[findCorrelation(cor.matrix, 0.9)]
+```
+
+## Training models
+### Create train/test sets
+The original data set was split into train and test sets with 25% for the test set and save them to separate files.
+```{r}
+set.seed(123)
+train.ids <- createDataPartition(set.train.1$classe, p = 0.75)[[1]]
+
+training <- set.train.1[train.ids, ]
+testing <- set.train.1[-train.ids, ]
+saveRDS(training, file='training.RDS')
+saveRDS(testing, file='testing.RDS')
+```
+
+### Training models
+Some models require much time to train, so running tasks inside `training` function in parallel will significantly reduce total train time.
+```{r}
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+```
+
+Train and save all models to separate file. Following methods were tried:
+ * `lda` - Linear Discriminant Analysis
+ * `qda` - Quadratic Discriminant Analysis
+ * `rpart` - CART, Recursive Partitioning and Regression Trees
+ * `gbm` - Stochastic Gradient Boosting
+ * `rf` - Random Forest
+ * `treebag` - Bagged CART
+ * `svmPoly` - Support Vector Machines with Polynomial Kernel
+```{r}
+models.file <- 'models.RDS'
+if (file.exists(models.file)) {
+  models <- readRDS(models.file)
+} else {
+  models <- sapply(c('lda', 'qda', 'rpart', 'gbm', 'rf', 'treebag', 'svmPoly'),
+                   function(x) {train(classe ~ ., data=training, method=x)}, USE.NAMES=T, simplify=F)
+  saveRDS(models, file='models.RDS')
+}
+```
+
+### Models summary
+```{r results='asis'}
+models.summary <- data.frame(t(
+  sapply(models, function(x) {
+    confMatrix <- confusionMatrix(testing$classe, predict(x, newdata=testing))
+    c(
+      'Accuracy.CV'=unname(max(x$results['Accuracy'])),
+      'Accuracy.Test'=unname(confMatrix$overall['Accuracy']),
+      'Accuracy.Test.lower'=unname(confMatrix$overall['AccuracyLower']),
+      'Accuracy.Test.upper'=unname(confMatrix$overall['AccuracyUpper']),
+      'time.train.total'=unname(x$times$everything['user.self']))
+  })
+))
+
+
+dt <- Datatables$new()
+dt$addTable(data.frame(Model=row.names(models.summary), models.summary), bPaginate=F, bSearchable=F, bFilter=F)
+dt$print('tbl_models_summary', include_assets=F, cdn=F)
+```
+`rpart`, `qda` and `lda` has pure accuracy but fast training time. `svmPoly` model has almost 100 accuracy and lowest training time.
+
+### Variables importance for good models
+```{r results='asis'}
+svmPoly.varImp <- varImp(models$svmPoly)$importance
+models.varImp <- cbind(gbm=unname(varImp(models$gbm)$importance),
+                       rf=unname(varImp(models$rf)$importance),
+                       treebag=unname(varImp(models$treebag)$importance),
+                       svmPoly=unname(data.frame(rowSums(svmPoly.varImp) / ncol(svmPoly.varImp)))
+                       )
+
+dt <- Datatables$new()
+dt$addTable(data.frame("Variable name"=row.names(models.varImp), models.varImp))
+dt$print('tbl_models_varImp', include_assets=F, cdn=F)
+```
+
+### Final model coefficients
+#### Stochastic Gradient Boosting
+```{r}
+models$gbm$finalModel
+```
+
+#### Random forests
+```{r}
+models$rf$finalModel
+```
+
+#### Bagged CART
+```{r}
+models$treebag$finalModel
+```
+
+#### Support Vector Machines with Polynomial Kernel
+```{r}
+models$svmPoly$finalModel
+```
